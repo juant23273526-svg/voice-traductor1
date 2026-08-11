@@ -1,0 +1,21 @@
+name = "voxlingo"
+compatibility_date = "2024-11-01"
+pages_build_output_dir = "dist"
+
+# Durable Object que sostiene el estado en memoria de cada Live Room
+# (conexiones WebSocket host/guest). Cloudflare Pages no permite definir ni
+# desplegar la clase del Durable Object dentro de este proyecto: la clase
+# RoomDurableObject vive en el Worker independiente room-worker/ (desplegado
+# aparte con `wrangler deploy --config room-worker/wrangler.toml`), y este
+# binding se conecta a el mediante `script_name`. Pages DO bindings requieren
+# `script_name`; en un Worker normal seria opcional.
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "RoomDurableObject"
+script_name = "voxlingo-room-worker"
+
+# Secrets (NO los pongas aqui, usa `wrangler pages secret put <NOMBRE>`):
+#   DEEPGRAM_API_KEY
+#   GEMINI_API_KEY
+#   ELEVENLABS_API_KEY
+#   CARTESIA_API_KEY   (opcional, alternativa a ElevenLabs)
