@@ -35,11 +35,19 @@ export async function loadFFmpeg(onProgress?: (ratio: number) => void): Promise<
   return loadPromise;
 }
 
-/** Extrae el audio de un archivo de video como .wav para enviarlo al pipeline STT/TTS. */
+// Debe coincidir con el umbral del backend (functions/api/translate.ts) y de
+// AudioPipelineService.ts: por debajo de esto no hay señal aprovechable para
+// STT y es mejor fallar aqui, con un mensaje claro, que gastar la llamada
+// completa a /api/translate para terminar en el mismo error.
+const MIN_AUDIO_BYTES = 2000;
+
+/** Extrae el audio de un archivo de video como .wav (PCM, tipo MIME explicito) para el pipeline STT/TTS. */
 export async function extractAudioFromVideo(videoFile: File): Promise<Blob> {
   const ffmpeg = await loadFFmpeg();
   const inputName = 'input' + getExtension(videoFile.name);
   const outputName = 'extracted-audio.wav';
+
+  console.log('[FFmpegService] Extrayendo audio de', videoFile.name, videoFile.type, videoFile.size, 'bytes');
 
   await ffmpeg.writeFile(inputName, await fetchFile(videoFile));
   await ffmpeg.exec(['-i', inputName, '-vn', '-acodec', 'pcm_s16le', '-ar', '44100', outputName]);
@@ -48,7 +56,18 @@ export async function extractAudioFromVideo(videoFile: File): Promise<Blob> {
   await ffmpeg.deleteFile(inputName);
   await ffmpeg.deleteFile(outputName);
 
-  return new Blob([data as Uint8Array<ArrayBuffer>], { type: 'audio/wav' });
+  // Siempre se etiqueta con un MIME type explicito (audio/wav): el pipeline
+  // de traduccion (callTranslateApi -> Deepgram) depende de blob.type para
+  // fijar el Content-Type real, nunca debe llegar como blob generico.
+  const audioBlob = new Blob([data as Uint8Array<ArrayBuffer>], { type: 'audio/wav' });
+  console.log('[FFmpegService] Audio extraido:', audioBlob.size, 'bytes,', audioBlob.type);
+
+  if (audioBlob.size < MIN_AUDIO_BYTES) {
+    console.error('[FFmpegService] El audio extraido es demasiado pequeño/vacio:', audioBlob.size, 'bytes');
+    throw new Error('El video no contiene una pista de audio aprovechable (silencio o sin audio). Prueba con otro clip.');
+  }
+
+  return audioBlob;
 }
 
 interface ExportClipOptions {

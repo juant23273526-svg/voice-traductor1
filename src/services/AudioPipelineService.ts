@@ -33,6 +33,12 @@ const MIME_TYPE_CANDIDATES = [
 // llamada de red.
 const MIN_AUDIO_BYTES = 2000;
 
+// Umbral de amplitud (0-1, normalizado desde AnalyserNode.getByteFrequencyData)
+// bajo el cual se considera que la grabacion no tuvo señal real de voz — un
+// microfono muteado por el SO, permisos otorgados pero hardware silenciado,
+// o el usuario hablando lejos del microfono.
+const SILENCE_PEAK_THRESHOLD = 0.02;
+
 function pickSupportedMimeType(): string | undefined {
   if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') {
     return undefined;
@@ -69,6 +75,8 @@ export class AudioPipelineService {
   private status: PipelineStatus = 'IDLE';
   private analyser: AnalyserNode | null = null;
   private volumeRafId: number | null = null;
+  /** Pico de amplitud detectado por el AnalyserNode durante la ultima grabacion (diagnostico de "silencio"). */
+  private peakVolume = 0;
 
   private listeners: { [K in keyof PipelineEventMap]?: Set<PipelineEventListener<K>> } = {};
 
@@ -104,6 +112,7 @@ export class AudioPipelineService {
     // de audio asincrono ajeno (ej. mensajes de Live Room) tambien quede
     // desbloqueada.
     unlockAudioPlayback();
+    this.peakVolume = 0;
 
     const constraints = { ...DEFAULT_RECORDER_OPTIONS, ...options };
     const preferredConstraints: MediaTrackConstraints = {
@@ -164,7 +173,15 @@ export class AudioPipelineService {
       recorder.stop();
     });
 
-    console.log('[AudioPipeline] Grabacion detenida:', blob.size, 'bytes,', blob.type);
+    console.log('[AudioPipeline] Grabacion detenida:', blob.size, 'bytes,', blob.type, '— pico de amplitud:', this.peakVolume.toFixed(3));
+    if (this.peakVolume < SILENCE_PEAK_THRESHOLD) {
+      console.warn(
+        '[AudioPipeline] El AnalyserNode casi no detecto amplitud durante la grabacion (pico:',
+        this.peakVolume.toFixed(3),
+        '). Posible microfono muteado/silenciado o el usuario hablo muy lejos — es probable que el backend reporte "audio en silencio".'
+      );
+    }
+
     this.teardownStream();
     this.setStatus('IDLE');
     return blob;
@@ -181,6 +198,31 @@ export class AudioPipelineService {
       if (audioBlob.size < MIN_AUDIO_BYTES) {
         console.error('[AudioPipeline] Audio capturado demasiado pequeño:', audioBlob.size, 'bytes — se aborta sin llamar al backend');
         throw new Error('Grabacion muy corta. Manten presionado el microfono mientras hablas.');
+      }
+
+      // Verificacion de amplitud real (diagnostico, no bloqueante): si el
+      // AnalyserNode nunca detecto una señal por encima del umbral de
+      // silencio durante toda la grabacion, es una fuerte señal de
+      // microfono muteado a nivel de SO / hardware, pero un umbral fijo
+      // puede dar falsos positivos con voces suaves o microfonos de baja
+      // sensibilidad — se loguea con fuerza para diagnostico y se combina
+      // con el tamaño del blob (señal mas confiable) para decidir si se
+      // aborta, en vez de bloquear solo por este heuristico.
+      const looksSilent = this.peakVolume < SILENCE_PEAK_THRESHOLD;
+      if (looksSilent) {
+        console.error(
+          '[AudioPipeline] Pico de amplitud sospechosamente bajo durante la grabacion:',
+          this.peakVolume.toFixed(3),
+          '(umbral:', SILENCE_PEAK_THRESHOLD, ') — blob de',
+          audioBlob.size,
+          'bytes. Posible microfono muteado o permisos otorgados sin señal real.'
+        );
+      }
+      if (looksSilent && audioBlob.size < MIN_AUDIO_BYTES * 3) {
+        // Silencio detectado por amplitud Y un blob que tampoco es
+        // holgadamente grande: combinacion suficientemente confiable para
+        // abortar antes de gastar la llamada de red completa.
+        throw new Error('No se detecto voz en el microfono. Revisa que no este muteado y que los permisos esten activos.');
       }
 
       this.setStatus('TRANSCRIBING');
@@ -249,7 +291,9 @@ export class AudioPipelineService {
       if (!this.analyser) return;
       this.analyser.getByteFrequencyData(data);
       const avg = data.reduce((sum, v) => sum + v, 0) / data.length;
-      this.emit('volume', avg / 255);
+      const normalized = avg / 255;
+      this.peakVolume = Math.max(this.peakVolume, normalized);
+      this.emit('volume', normalized);
       this.volumeRafId = requestAnimationFrame(tick);
     };
     tick();

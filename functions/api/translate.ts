@@ -40,6 +40,33 @@ interface PipelineMeta {
   speedMultiplier?: number;
 }
 
+// Extension -> MIME real, usada como respaldo cuando el navegador entrega un
+// Blob sin `type` (o generico "application/octet-stream") en el FormData
+// multipart. El Content-Type EXTERNO de la request siempre es
+// `multipart/form-data; boundary=...`; el que importa para Deepgram es el
+// de la PARTE `audio` (`audio.type`), nunca el de la request completa.
+const EXTENSION_TO_MIME: Record<string, string> = {
+  webm: 'audio/webm',
+  mp4: 'audio/mp4',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  wav: 'audio/wav',
+  mp3: 'audio/mpeg',
+  ogg: 'audio/ogg',
+};
+
+function resolveAudioContentType(file: File): string {
+  if (file.type && file.type !== 'application/octet-stream') return file.type;
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+  const inferred = EXTENSION_TO_MIME[ext];
+  if (inferred) {
+    console.log('[translate] audio.type venia vacio/generico, inferido por extension:', ext, '->', inferred);
+    return inferred;
+  }
+  console.warn('[translate] No se pudo determinar el Content-Type real del audio, se usa audio/webm por defecto');
+  return 'audio/webm';
+}
+
 export const onRequestOptions: PagesFunction = async () => preflightResponse();
 
 export const onRequestPost: PagesFunction<Env> = async (context) => {
@@ -58,18 +85,35 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
 
     const meta = JSON.parse(metaRaw) as PipelineMeta;
     const audioBuffer = await audio.arrayBuffer();
+    const resolvedContentType = resolveAudioContentType(audio);
+
+    // Inspeccion de payload: Content-Type real de la parte "audio" (nunca el
+    // Content-Type externo `multipart/form-data` de toda la request) y
+    // tamaño exacto en bytes recibido — primer punto de diagnostico para
+    // "no se detecto voz".
+    console.log(
+      '[translate] Payload recibido — filename:',
+      audio.name,
+      'raw type:',
+      audio.type || '(vacio)',
+      'resolved Content-Type:',
+      resolvedContentType,
+      'bytes:',
+      audioBuffer.byteLength
+    );
 
     if (audioBuffer.byteLength < MIN_AUDIO_BYTES) {
-      console.error('[translate] Audio demasiado pequeño, se descarta sin llamar a Deepgram:', audioBuffer.byteLength, 'bytes');
+      console.error('[translate] Audio demasiado pequeño/vacio, se descarta sin llamar a Deepgram:', audioBuffer.byteLength, 'bytes');
       return jsonResponse(
         { error: 'Audio muy corto o vacío. Manten presionado el microfono mientras hablas.' },
-        422
+        400
       );
     }
 
-    const { transcript, detectedLanguage } = await runSpeechToText(audioBuffer, audio.type, meta.sourceLanguage, env);
+    const { transcript, detectedLanguage } = await runSpeechToText(audioBuffer, resolvedContentType, meta.sourceLanguage, env);
     if (!transcript) {
-      return jsonResponse({ error: 'No se detecto voz en el audio' }, 422);
+      console.error('[translate] Deepgram no devolvio transcript (audio inaudible/silencio). bytes:', audioBuffer.byteLength, 'contentType:', resolvedContentType);
+      return jsonResponse({ error: 'Audio inaudible o en silencio. Intenta grabar de nuevo hablando mas cerca del microfono.' }, 400);
     }
 
     const translatedText = await runTranslation(transcript, detectedLanguage || meta.sourceLanguage, meta, env);
@@ -90,7 +134,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
 
 async function runSpeechToText(
   audioBuffer: ArrayBuffer,
-  contentType: string,
+  resolvedContentType: string,
   sourceLanguage: string,
   env: Env
 ): Promise<{ transcript: string; detectedLanguage: string }> {
@@ -105,10 +149,7 @@ async function runSpeechToText(
   // "auto"/vacio (Clip Studio) se usa español como default explicito.
   const language = sourceLanguage && sourceLanguage !== 'auto' ? sourceLanguage : 'es';
 
-  // El Content-Type real del blob (audio/webm, audio/mp4, audio/aac en iOS
-  // Safari, etc.) se pasa tal cual llega del cliente — nunca se asume webm.
-  const resolvedContentType = contentType || 'audio/webm';
-  console.log('[translate] STT Deepgram — language:', language, 'contentType:', resolvedContentType, 'bytes:', audioBuffer.byteLength);
+  console.log('[translate] STT Deepgram — language:', language, 'Content-Type:', resolvedContentType, 'bytes:', audioBuffer.byteLength);
 
   const params = new URLSearchParams({
     model: 'nova-2',
@@ -135,8 +176,18 @@ async function runSpeechToText(
   };
 
   const channel = data.results.channels[0];
+  const transcript = channel?.alternatives[0]?.transcript ?? '';
+
+  if (!transcript) {
+    // No se lanza excepcion: se loguea la respuesta completa de Deepgram
+    // para inspeccion (permite distinguir "silencio real" de "Deepgram no
+    // encontro el canal esperado" o un problema de decodificacion del
+    // contenedor/codec) y se deja que el caller decida el mensaje al cliente.
+    console.error('[translate] Deepgram respondio 200 pero sin transcript. Respuesta completa:', JSON.stringify(data));
+  }
+
   return {
-    transcript: channel?.alternatives[0]?.transcript ?? '',
+    transcript,
     detectedLanguage: channel?.detected_language || language,
   };
 }
@@ -147,35 +198,43 @@ async function runTranslation(
   meta: PipelineMeta,
   env: Env
 ): Promise<string> {
-  if (!env.GEMINI_API_KEY) {
-    return `(demo) ${text}`;
-  }
-
-  const instructions =
-    meta.systemPrompt ??
-    `Traduce el siguiente texto de ${sourceLanguage} a ${meta.targetLanguage}. Conserva el tono y la emocion. Responde unicamente con la traduccion, sin explicaciones.`;
-
-  // Si hay un override explicito (env.GEMINI_MODEL) se intenta primero; luego
-  // se recorre la lista de fallback. Duplicados se descartan.
-  const models = Array.from(new Set([env.GEMINI_MODEL, ...GEMINI_MODEL_FALLBACKS].filter(Boolean))) as string[];
-
-  let lastError: Error | null = null;
-  for (const model of models) {
-    try {
-      return await callGeminiGenerateContent(model, instructions, text, env.GEMINI_API_KEY);
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-      console.error(`[translate] Gemini modelo "${model}" fallo, probando siguiente si hay:`, lastError.message);
+  try {
+    // Validacion explicita: si la key no llego desde las env vars de
+    // Cloudflare Pages (typo en el nombre del secret, no configurada en el
+    // ambiente correcto, etc.) se loguea como error diagnosticable en vez de
+    // fallar silenciosamente mas adelante con un 401/403 dificil de rastrear.
+    if (!env.GEMINI_API_KEY) {
+      throw new Error('GEMINI_API_KEY no configurada en env');
     }
-  }
 
-  // Fallback estatico/local: si TODOS los modelos de Gemini fallan (404, rate
-  // limit, region bloqueada, etc.) no se rompe el pipeline completo con un
-  // 500 — se degrada devolviendo el texto original sin traducir, para que el
-  // cliente reciba una respuesta 200 parseable (transcripcion + audio TTS
-  // siguen funcionando) en vez de un error duro.
-  console.error('[translate] Gemini fallo con todos los modelos configurados, usando fallback local:', lastError?.message);
-  return text;
+    const instructions =
+      meta.systemPrompt ??
+      `Traduce el siguiente texto de ${sourceLanguage} a ${meta.targetLanguage}. Conserva el tono y la emocion. Responde unicamente con la traduccion, sin explicaciones.`;
+
+    // Si hay un override explicito (env.GEMINI_MODEL) se intenta primero;
+    // luego se recorre la lista de fallback. Duplicados se descartan.
+    const models = Array.from(new Set([env.GEMINI_MODEL, ...GEMINI_MODEL_FALLBACKS].filter(Boolean))) as string[];
+
+    let lastError: Error | null = null;
+    for (const model of models) {
+      try {
+        return await callGeminiGenerateContent(model, instructions, text, env.GEMINI_API_KEY);
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        console.error(`[translate] Gemini modelo "${model}" fallo, probando siguiente si hay:`, lastError.message);
+      }
+    }
+
+    throw lastError ?? new Error('Gemini fallo con todos los modelos configurados');
+  } catch (err) {
+    // Respuesta resiliente: cualquier fallo irrecuperable de Gemini (key
+    // ausente, 401/403/429, todos los modelos agotados, filtros de
+    // seguridad) degrada devolviendo el texto original transcrito por
+    // Deepgram, para que el pipeline de voz/TTS siga funcionando en vez de
+    // romper la respuesta completa con un 500.
+    console.error('[translate] Gemini fallo de forma irrecuperable, fallback al texto original:', err instanceof Error ? err.message : err);
+    return text;
+  }
 }
 
 async function callGeminiGenerateContent(
@@ -184,14 +243,21 @@ async function callGeminiGenerateContent(
   text: string,
   apiKey: string
 ): Promise<string> {
+  // Esquema minimo/estable de la API v1beta: un unico bloque de texto en
+  // `contents[0].parts[0].text` (se fusionan las instrucciones de sistema y
+  // el texto a traducir en el mismo string) en vez de depender del campo
+  // opcional `systemInstruction`, que no todas las versiones/variantes de
+  // modelo soportan igual — menos superficie posible de 400 Bad Request por
+  // un esquema no coincidente.
+  const prompt = `${systemInstruction}\n\nTexto:\n${text}`;
+
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemInstruction }] },
-        contents: [{ role: 'user', parts: [{ text }] }],
+        contents: [{ parts: [{ text: prompt }] }],
         // Los presets de jerga/dialecto (Spanglish Fronterizo, Norteño, etc.)
         // usan lenguaje coloquial que los umbrales default de Gemini a veces
         // bloquean por error; se relajan a BLOCK_ONLY_HIGH para evitar
@@ -208,7 +274,11 @@ async function callGeminiGenerateContent(
   );
 
   if (!response.ok) {
+    // Log de diagnostico completo (status + body sin truncar) para poder
+    // distinguir en los logs de Cloudflare entre 401 Unauthorized (key
+    // invalida), 400 Bad Request (esquema), 403 Quota Exceeded, etc.
     const errorBody = await response.text().catch(() => '');
+    console.error(`[translate] Gemini (${model}) HTTP ${response.status}. Body completo:`, errorBody);
     throw new Error(`Gemini (${model}) fallo: ${response.status} ${errorBody.slice(0, 300)}`);
   }
 
@@ -225,6 +295,7 @@ async function callGeminiGenerateContent(
 
   if (!translated) {
     const reason = data.promptFeedback?.blockReason ?? candidate?.finishReason ?? 'desconocida';
+    console.error(`[translate] Gemini (${model}) respondio 200 sin texto util. Respuesta completa:`, JSON.stringify(data));
     throw new Error(`Gemini (${model}) no devolvio texto valido (razon: ${reason})`);
   }
 
