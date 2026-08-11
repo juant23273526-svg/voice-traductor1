@@ -6,6 +6,9 @@ export interface RoomSocketHandle {
 }
 
 function buildRoomWsUrl(roomId: string, role: RoomParticipantRole): string {
+  // En https:// (obligatorio para PWA/microfono en iOS Safari) el WebSocket
+  // debe usar wss:// — un ws:// desde una pagina https es bloqueado por el
+  // navegador (mixed content).
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${protocol}//${window.location.host}/api/room/${roomId}?role=${role}`;
 }
@@ -21,26 +24,40 @@ export function connectToRoom(
   onEvent: (event: RoomSocketEvent) => void,
   onStatusChange: (status: 'connecting' | 'open' | 'closed' | 'error') => void
 ): RoomSocketHandle {
-  const socket = new WebSocket(buildRoomWsUrl(roomId, role));
+  const wsUrl = buildRoomWsUrl(roomId, role);
+  console.log('[RoomSocket] Conectando a', wsUrl);
+  const socket = new WebSocket(wsUrl);
   onStatusChange('connecting');
 
-  socket.onopen = () => onStatusChange('open');
-  socket.onclose = () => onStatusChange('closed');
-  socket.onerror = () => onStatusChange('error');
+  socket.onopen = () => {
+    console.log('[RoomSocket] Conexion abierta');
+    onStatusChange('open');
+  };
+  socket.onclose = (event) => {
+    console.log('[RoomSocket] Conexion cerrada', event.code, event.reason);
+    onStatusChange('closed');
+  };
+  socket.onerror = (event) => {
+    console.error('[RoomSocket] Error de WebSocket', event);
+    onStatusChange('error');
+  };
 
   socket.onmessage = (event: MessageEvent) => {
     if (typeof event.data !== 'string') return;
     try {
       const parsed = JSON.parse(event.data) as RoomSocketEvent;
       onEvent(parsed);
-    } catch {
-      // mensaje no valido, se ignora
+    } catch (err) {
+      console.error('[RoomSocket] Mensaje invalido recibido, se ignora', err);
     }
   };
 
   return {
     send: (message: RoomMessage) => {
-      if (socket.readyState !== WebSocket.OPEN) return;
+      if (socket.readyState !== WebSocket.OPEN) {
+        console.warn('[RoomSocket] Intento de enviar con socket no abierto (readyState=', socket.readyState, ')');
+        return;
+      }
       const event: RoomSocketEvent = { type: 'message', message };
       socket.send(JSON.stringify(event));
     },

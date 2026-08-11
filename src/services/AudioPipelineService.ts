@@ -14,6 +14,29 @@ const DEFAULT_RECORDER_OPTIONS: Required<AudioRecorderOptions> = {
   sampleRate: 48000,
 };
 
+// Orden de preferencia de MIME types para MediaRecorder. Safari iOS no soporta
+// audio/webm (hasta iOS 17.x); usa audio/mp4 (AAC). Se elige el primero soportado
+// en runtime via MediaRecorder.isTypeSupported.
+const MIME_TYPE_CANDIDATES = [
+  'audio/webm;codecs=opus',
+  'audio/webm',
+  'audio/mp4;codecs=mp4a.40.2',
+  'audio/mp4',
+  'audio/aac',
+  'audio/mpeg',
+];
+
+function pickSupportedMimeType(): string | undefined {
+  if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') {
+    return undefined;
+  }
+  const supported = MIME_TYPE_CANDIDATES.find((type) => MediaRecorder.isTypeSupported(type));
+  if (!supported) {
+    console.warn('[AudioPipeline] Ningun mimeType candidato soportado, se usara el default del navegador');
+  }
+  return supported;
+}
+
 export interface RunTranslationOptions {
   sourceLanguage: string;
   targetLanguage: string;
@@ -67,30 +90,54 @@ export class AudioPipelineService {
   async startRecording(options: AudioRecorderOptions = {}): Promise<void> {
     if (this.status === 'RECORDING') return;
 
-    const constraints = { ...DEFAULT_RECORDER_OPTIONS, ...options };
+    // Debe ejecutarse de forma sincrona (antes del primer `await`) para que
+    // el AudioContext se desbloquee dentro del mismo gesto de usuario que
+    // origino esta llamada (pointerdown del boton de microfono) — requisito
+    // de la politica de autoplay de iOS Safari.
+    this.unlockAudioPlayback();
 
-    this.mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: constraints.echoCancellation,
-        noiseSuppression: constraints.noiseSuppression,
-        autoGainControl: constraints.autoGainControl,
-        sampleRate: constraints.sampleRate,
-      },
-    });
+    const constraints = { ...DEFAULT_RECORDER_OPTIONS, ...options };
+    const preferredConstraints: MediaTrackConstraints = {
+      echoCancellation: constraints.echoCancellation,
+      noiseSuppression: constraints.noiseSuppression,
+      autoGainControl: constraints.autoGainControl,
+      sampleRate: constraints.sampleRate,
+    };
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: preferredConstraints });
+    } catch (err) {
+      console.error(
+        '[AudioPipeline] getUserMedia con constraints avanzadas fallo (comun en iOS Safari), reintentando con audio:true',
+        err
+      );
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+    this.mediaStream = stream;
+
+    const audioTrack = stream.getAudioTracks()[0];
+    console.log('[AudioPipeline] Microfono capturado:', audioTrack?.label, audioTrack?.getSettings());
 
     this.chunks = [];
-    this.mediaRecorder = new MediaRecorder(this.mediaStream, {
-      mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-        ? 'audio/webm;codecs=opus'
-        : 'audio/webm',
-    });
+    const mimeType = pickSupportedMimeType();
+    console.log('[AudioPipeline] MediaRecorder mimeType:', mimeType ?? '(default del navegador)');
+    this.mediaRecorder = mimeType
+      ? new MediaRecorder(stream, { mimeType })
+      : new MediaRecorder(stream);
 
     this.mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) this.chunks.push(e.data);
+      if (e.data.size > 0) {
+        this.chunks.push(e.data);
+        console.log('[AudioPipeline] chunk recibido:', e.data.size, 'bytes');
+      }
+    };
+    this.mediaRecorder.onerror = (e) => {
+      console.error('[AudioPipeline] MediaRecorder error:', e);
     };
 
     this.mediaRecorder.start(250);
-    this.setupVolumeMeter(this.mediaStream);
+    this.setupVolumeMeter(stream);
     this.setStatus('RECORDING');
   }
 
@@ -108,6 +155,7 @@ export class AudioPipelineService {
       recorder.stop();
     });
 
+    console.log('[AudioPipeline] Grabacion detenida:', blob.size, 'bytes,', blob.type);
     this.teardownStream();
     this.setStatus('IDLE');
     return blob;
@@ -162,7 +210,7 @@ export class AudioPipelineService {
 
       if (options.autoPlay !== false && apiResult.audioBase64) {
         this.setStatus('PLAYING');
-        await this.playAudio(synthesis.audioUrl);
+        await this.playAudio(audioBlobResult);
       }
       this.setStatus('IDLE');
 
@@ -175,19 +223,83 @@ export class AudioPipelineService {
     }
   }
 
-  private playAudio(audioUrl: string): Promise<void> {
+  /**
+   * Crea (una sola vez) el AudioContext compartido del servicio. Se reutiliza
+   * tanto para el medidor de volumen como para la reproduccion del TTS, ya
+   * que en iOS Safari solo un AudioContext "desbloqueado" por un gesto de
+   * usuario puede reproducir audio programaticamente despues.
+   */
+  private ensureAudioContext(): AudioContext {
+    if (!this.audioContext) {
+      const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.audioContext = new Ctor();
+    }
+    return this.audioContext;
+  }
+
+  /**
+   * Desbloquea la reproduccion de audio en iOS Safari: debe llamarse de forma
+   * sincrona dentro del gesto de usuario (click/touch) que inicia la
+   * grabacion, antes de cualquier `await`. Resume el AudioContext y reproduce
+   * un buffer silencioso para "activar" el audio de la pagina.
+   */
+  private unlockAudioPlayback(): void {
+    try {
+      const ctx = this.ensureAudioContext();
+      if (ctx.state === 'suspended') {
+        void ctx.resume().then(
+          () => console.log('[AudioPipeline] AudioContext resumido (iOS unlock)'),
+          (err) => console.error('[AudioPipeline] No se pudo resumir AudioContext', err)
+        );
+      }
+      const silentBuffer = ctx.createBuffer(1, 1, 22050);
+      const source = ctx.createBufferSource();
+      source.buffer = silentBuffer;
+      source.connect(ctx.destination);
+      source.start(0);
+    } catch (err) {
+      console.error('[AudioPipeline] Fallo al desbloquear audio (iOS)', err);
+    }
+  }
+
+  /**
+   * Reproduce el audio TTS via Web Audio API (decodeAudioData + BufferSource)
+   * usando el AudioContext ya desbloqueado, en vez de `new Audio().play()`
+   * que iOS Safari puede bloquear si no ocurre dentro del gesto de usuario.
+   */
+  private async playAudio(audioBlob: Blob): Promise<void> {
+    const ctx = this.ensureAudioContext();
+    if (ctx.state === 'suspended') {
+      await ctx.resume().catch((err) => console.error('[AudioPipeline] No se pudo resumir AudioContext antes de reproducir', err));
+    }
+
+    let audioBuffer: AudioBuffer;
+    try {
+      const arrayBuffer = await audioBlob.arrayBuffer();
+      audioBuffer = await ctx.decodeAudioData(arrayBuffer);
+    } catch (err) {
+      console.error('[AudioPipeline] Error decodificando audio TTS', err);
+      throw err instanceof Error ? err : new Error('Error decodificando audio sintetizado');
+    }
+
     return new Promise((resolve, reject) => {
-      const audio = new Audio(audioUrl);
-      audio.onended = () => resolve();
-      audio.onerror = () => reject(new Error('Error reproduciendo audio sintetizado'));
-      void audio.play();
+      try {
+        const source = ctx.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(ctx.destination);
+        source.onended = () => resolve();
+        source.start(0);
+      } catch (err) {
+        console.error('[AudioPipeline] Error reproduciendo audio TTS', err);
+        reject(err instanceof Error ? err : new Error('Error reproduciendo audio sintetizado'));
+      }
     });
   }
 
   private setupVolumeMeter(stream: MediaStream): void {
-    this.audioContext = new AudioContext();
-    const source = this.audioContext.createMediaStreamSource(stream);
-    this.analyser = this.audioContext.createAnalyser();
+    const ctx = this.ensureAudioContext();
+    const source = ctx.createMediaStreamSource(stream);
+    this.analyser = ctx.createAnalyser();
     this.analyser.fftSize = 256;
     source.connect(this.analyser);
 
@@ -208,8 +320,9 @@ export class AudioPipelineService {
       this.volumeRafId = null;
     }
     this.analyser = null;
-    void this.audioContext?.close();
-    this.audioContext = null;
+    // El AudioContext se mantiene vivo (no se cierra) entre grabaciones:
+    // en iOS Safari solo permanece "desbloqueado" mientras no se cree uno
+    // nuevo fuera de un gesto de usuario.
     this.mediaStream?.getTracks().forEach((track) => track.stop());
     this.mediaStream = null;
     this.mediaRecorder = null;
@@ -217,6 +330,8 @@ export class AudioPipelineService {
 
   dispose(): void {
     this.teardownStream();
+    void this.audioContext?.close();
+    this.audioContext = null;
     this.listeners = {};
   }
 }

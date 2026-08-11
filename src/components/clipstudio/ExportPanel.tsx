@@ -3,6 +3,7 @@ import { Download, Loader2 } from 'lucide-react';
 import { exportDubbedClip } from '@/services/FFmpegService';
 import { buildSrtFromWords } from '@/utils/subtitles';
 import type { WordTimestamp } from '@/types';
+import { DEFAULT_SUBTITLE_STYLE, type SubtitleStyle } from '@/types/clipstudio';
 
 interface ExportPanelProps {
   videoFile: File;
@@ -10,6 +11,7 @@ interface ExportPanelProps {
   wordCues: WordTimestamp[];
   burnSubtitles: boolean;
   onBurnSubtitlesChange: (value: boolean) => void;
+  subtitleStyle?: SubtitleStyle;
 }
 
 export function ExportPanel({
@@ -18,6 +20,7 @@ export function ExportPanel({
   wordCues,
   burnSubtitles,
   onBurnSubtitlesChange,
+  subtitleStyle = DEFAULT_SUBTITLE_STYLE,
 }: ExportPanelProps) {
   const [isExporting, setIsExporting] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -36,10 +39,12 @@ export function ExportPanel({
         videoFile,
         dubbedAudioBlob,
         srtContent,
+        subtitleStyle,
         onProgress: setProgress,
       });
       setDownloadUrl(URL.createObjectURL(outputBlob));
     } catch (err) {
+      console.error('[ExportPanel] Error exportando clip', err);
       setError(err instanceof Error ? err.message : 'Error exportando el clip');
     } finally {
       setIsExporting(false);

@@ -1,5 +1,6 @@
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import type { SubtitleStyle } from '@/types/clipstudio';
 
 const CORE_BASE_URL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
 
@@ -54,7 +55,37 @@ interface ExportClipOptions {
   videoFile: File;
   dubbedAudioBlob: Blob;
   srtContent?: string;
+  subtitleStyle?: SubtitleStyle;
   onProgress?: (ratio: number) => void;
+}
+
+/** Convierte un color hex (#RRGGBB) al formato ASS/SSA &H00BBGGRR usado por libass. */
+function hexToAssColor(hex: string): string {
+  const clean = hex.replace('#', '');
+  const r = clean.slice(0, 2);
+  const g = clean.slice(2, 4);
+  const b = clean.slice(4, 6);
+  return `&H00${b}${g}${r}`.toUpperCase();
+}
+
+/** Alineacion numpad de ASS/SSA: 2=abajo-centro, 5=centro-centro, 8=arriba-centro. */
+function assAlignmentFor(position: SubtitleStyle['position']): number {
+  if (position === 'top') return 8;
+  if (position === 'middle') return 5;
+  return 2;
+}
+
+function buildForceStyle(style: SubtitleStyle): string {
+  const fontName = style.fontFamily.split(',')[0].replace(/["']/g, '').trim() || 'Arial';
+  return [
+    `FontName=${fontName}`,
+    'FontSize=18',
+    `PrimaryColour=${hexToAssColor(style.highlightColor)}`,
+    'OutlineColour=&H00020617',
+    'BorderStyle=1',
+    'Outline=1.4',
+    `Alignment=${assAlignmentFor(style.position)}`,
+  ].join(',');
 }
 
 /**
@@ -65,6 +96,7 @@ export async function exportDubbedClip({
   videoFile,
   dubbedAudioBlob,
   srtContent,
+  subtitleStyle,
   onProgress,
 }: ExportClipOptions): Promise<Blob> {
   const ffmpeg = await loadFFmpeg(onProgress);
@@ -79,7 +111,8 @@ export async function exportDubbedClip({
   const filterArgs: string[] = [];
   if (srtContent) {
     await ffmpeg.writeFile(subsInput, srtContent);
-    filterArgs.push('-vf', `subtitles=${subsInput}:force_style='FontSize=18,PrimaryColour=&H00E2FFD1'`);
+    const forceStyle = buildForceStyle(subtitleStyle ?? { highlightColor: '#10b981', fontFamily: 'Arial', position: 'bottom' });
+    filterArgs.push('-vf', `subtitles=${subsInput}:force_style='${forceStyle}'`);
   }
 
   await ffmpeg.exec([

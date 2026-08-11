@@ -3,6 +3,7 @@ import { Loader2, CheckCircle2 } from 'lucide-react';
 import { extractAudioFromVideo } from '@/services/FFmpegService';
 import { callTranslateApi, base64ToBlob } from '@/services/translateApi';
 import { buildWordCues } from '@/utils/subtitles';
+import { getAudioDurationMs } from '@/utils/media';
 import type { TranslationResult, SynthesisResult, WordTimestamp } from '@/types';
 
 export interface DubbingOutput {
@@ -66,11 +67,15 @@ export function DubbingProcessor({
 
         setStep('synthesizing');
         const audioBlobResult = base64ToBlob(apiResult.audioBase64, apiResult.mimeType);
+        // Se usa la duracion real del audio decodificado (mas precisa que la
+        // estimacion heuristica del backend) para sincronizar los subtitulos.
+        const realDurationMs = await getAudioDurationMs(audioBlobResult);
         const synthesis: SynthesisResult = {
           audioUrl: URL.createObjectURL(audioBlobResult),
           audioBlob: audioBlobResult,
-          durationMs: apiResult.durationEstimateMs,
+          durationMs: realDurationMs || apiResult.durationEstimateMs,
         };
+        if (cancelled) return;
         const translation: TranslationResult = {
           originalText: apiResult.transcript,
           translatedText: apiResult.translatedText,
