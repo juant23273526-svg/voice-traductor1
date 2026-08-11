@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
-import { Loader2, CheckCircle2 } from 'lucide-react';
 import { extractAudioFromVideo } from '@/services/FFmpegService';
 import { callTranslateApi, base64ToBlob } from '@/services/translateApi';
 import { buildWordCues } from '@/utils/subtitles';
 import { getAudioDurationMs } from '@/utils/media';
+import { useSimulatedVolume } from '@/hooks/useSimulatedVolume';
+import { StageChecklist, type StageItem } from '@/components/shared/StageChecklist';
+import { WaveformVisualizer } from '@/components/shared/WaveformVisualizer';
 import type { TranslationResult, SynthesisResult, WordTimestamp } from '@/types';
 
 export interface DubbingOutput {
@@ -23,14 +25,26 @@ interface DubbingProcessorProps {
 
 type Step = 'extracting' | 'translating' | 'synthesizing' | 'done';
 
-const STEP_LABELS: Record<Step, string> = {
-  extracting: 'Extrayendo audio del video...',
-  translating: 'Transcribiendo y traduciendo (edge)...',
-  synthesizing: 'Clonando voz y generando doblaje...',
-  done: 'Doblaje listo',
+// El backend resuelve STT+LLM+TTS en UNA sola llamada de red (`translating`),
+// asi que no hay eventos reales entre "transcribiendo" y "traduciendo" — se
+// simula ese sub-avance con un timer local (solo cosmetico, no altera
+// /api/translate ni el tiempo real de espera) para mostrar las 4 etapas que
+// el usuario espera ver: Extrayendo -> Transcribiendo -> Traduciendo -> Sintetizando.
+const FLAT_STEPS = ['extracting', 'transcribing', 'translating', 'synthesizing'] as const;
+type FlatStep = (typeof FLAT_STEPS)[number];
+
+const FLAT_LABELS: Record<FlatStep, string> = {
+  extracting: 'Extrayendo audio del video',
+  transcribing: 'Transcribiendo tu voz',
+  translating: 'Traduciendo con IA',
+  synthesizing: 'Generando la voz doblada',
 };
 
-const STEP_ORDER: Step[] = ['extracting', 'translating', 'synthesizing', 'done'];
+function currentFlatStep(step: Step, translateSubStage: number): FlatStep {
+  if (step === 'extracting') return 'extracting';
+  if (step === 'translating') return translateSubStage === 0 ? 'transcribing' : 'translating';
+  return 'synthesizing';
+}
 
 /**
  * Orquesta el pipeline de doblaje sintetico para Clip Studio:
@@ -46,6 +60,17 @@ export function DubbingProcessor({
   onError,
 }: DubbingProcessorProps) {
   const [step, setStep] = useState<Step>('extracting');
+  const [translateSubStage, setTranslateSubStage] = useState(0);
+  const waveformVolume = useSimulatedVolume(step !== 'done');
+
+  useEffect(() => {
+    if (step !== 'translating') {
+      setTranslateSubStage(0);
+      return;
+    }
+    const timeout = setTimeout(() => setTranslateSubStage(1), 1400);
+    return () => clearTimeout(timeout);
+  }, [step]);
 
   useEffect(() => {
     let cancelled = false;
@@ -96,29 +121,18 @@ export function DubbingProcessor({
     };
   }, [videoFile, sourceLanguageCode, targetLanguageCode, voiceId, onComplete, onError]);
 
-  return (
-    <div className="flex flex-col gap-3 rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
-      {STEP_ORDER.map((s) => {
-        const currentIndex = STEP_ORDER.indexOf(step);
-        const stepIndex = STEP_ORDER.indexOf(s);
-        const isDone = stepIndex < currentIndex || step === 'done';
-        const isActive = s === step && step !== 'done';
+  const current = currentFlatStep(step, translateSubStage);
+  const currentIndex = FLAT_STEPS.indexOf(current);
+  const items: StageItem[] = FLAT_STEPS.map((flatStep, i) => ({
+    id: flatStep,
+    label: FLAT_LABELS[flatStep],
+    state: step === 'done' || i < currentIndex ? 'done' : i === currentIndex ? 'active' : 'pending',
+  }));
 
-        return (
-          <div key={s} className="flex items-center gap-3 text-sm">
-            {isDone ? (
-              <CheckCircle2 size={16} className="text-emerald-400" />
-            ) : isActive ? (
-              <Loader2 size={16} className="animate-spin text-indigo-400" />
-            ) : (
-              <span className="h-4 w-4 rounded-full border border-slate-700" />
-            )}
-            <span className={isDone ? 'text-slate-300' : isActive ? 'text-slate-100' : 'text-slate-600'}>
-              {STEP_LABELS[s]}
-            </span>
-          </div>
-        );
-      })}
+  return (
+    <div className="flex flex-col gap-4 rounded-2xl border border-slate-800 bg-slate-900/50 p-5">
+      <WaveformVisualizer volume={waveformVolume} active={step !== 'done'} barColor="#818cf8" className="w-full" />
+      <StageChecklist items={items} />
     </div>
   );
 }

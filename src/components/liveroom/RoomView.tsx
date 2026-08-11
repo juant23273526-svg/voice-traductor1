@@ -7,9 +7,13 @@ import { SplitScreenMic } from './SplitScreenMic';
 import { SubtitleOverlay } from './SubtitleOverlay';
 import { QRCodeDisplay } from './QRCodeDisplay';
 import { WaveformVisualizer } from '@/components/shared/WaveformVisualizer';
+import { ProcessingStages } from '@/components/shared/ProcessingStages';
+import { useSimulatedVolume } from '@/hooks/useSimulatedVolume';
 import { getLanguageOption } from '@/constants/languages';
 import { blobToBase64 } from '@/utils/blob';
 import type { RoomMessage, RoomParticipantRole } from '@/types';
+
+const SIMPLE_STATUSES = new Set(['IDLE', 'RECORDING', 'ERROR', 'PLAYING']);
 
 const CONNECTION_BADGE = {
   connecting: { label: 'Conectando...', icon: Loader2, className: 'text-amber-400', spin: true },
@@ -29,7 +33,20 @@ export function RoomView({ roomId, role, hostLanguage, guestLanguage }: RoomView
   const { messages, sendMessage, connectionStatus, loading, error, guestJoined } = useRoom(roomId, role);
   const { service, status, volume } = useAudioPipelineContext();
   const [activeSide, setActiveSide] = useState<'own' | 'peer' | null>(null);
+  // A diferencia de activeSide (que vuelve a null apenas se suelta el boton,
+  // para liberar la UI del microfono), processingSide se mantiene mientras
+  // dura el pipeline async completo, para poder seguir coloreando el
+  // waveform/ProcessingStages segun quien hablo mientras se espera la red.
+  const [processingSide, setProcessingSide] = useState<'own' | 'peer' | null>(null);
   const [pipelineError, setPipelineError] = useState<string | null>(null);
+
+  // La traduccion (STT->LLM->TTS) ocurre en una sola llamada de red antes de
+  // relayar por WebSocket — no hay señal real de microfono durante esa
+  // espera, asi que el Canvas se alimenta con una onda simulada en vez de
+  // congelarse o mostrar solo un spinner.
+  const isProcessing = !SIMPLE_STATUSES.has(status);
+  const simulatedVolume = useSimulatedVolume(isProcessing);
+  const waveformVolume = status === 'RECORDING' ? volume : simulatedVolume;
 
   // Indicador visual de actividad del socket: se enciende brevemente cada vez
   // que llega un mensaje nuevo (texto + audio) desde el Durable Object, para
@@ -53,6 +70,7 @@ export function RoomView({ roomId, role, hostLanguage, guestLanguage }: RoomView
   const handlePressStart = useCallback(
     async (side: 'own' | 'peer') => {
       setActiveSide(side);
+      setProcessingSide(side);
       setPipelineError(null);
       await service.startRecording();
     },
@@ -91,6 +109,8 @@ export function RoomView({ roomId, role, hostLanguage, guestLanguage }: RoomView
         sendMessage(message);
       } catch (err) {
         setPipelineError(err instanceof Error ? err.message : 'Error procesando el audio');
+      } finally {
+        setProcessingSide(null);
       }
     },
     [service, ownLanguage, peerLanguage, role, sendMessage]
@@ -149,14 +169,16 @@ export function RoomView({ roomId, role, hostLanguage, guestLanguage }: RoomView
         onPressEnd={handlePressEnd}
       />
 
-      {activeSide && (
+      {(activeSide || processingSide) && (
         <WaveformVisualizer
-          volume={volume}
-          active={status === 'RECORDING'}
-          barColor={activeSide === 'own' ? '#6366f1' : '#10b981'}
+          volume={waveformVolume}
+          active={status === 'RECORDING' || isProcessing}
+          barColor={(activeSide ?? processingSide) === 'peer' ? '#10b981' : '#6366f1'}
           className="mx-auto"
         />
       )}
+
+      {isProcessing && <ProcessingStages status={status} className="mx-auto w-full max-w-xs" />}
 
       {pipelineError && (
         <p className="rounded-xl border border-rose-900 bg-rose-950/40 px-4 py-3 text-sm text-rose-300">

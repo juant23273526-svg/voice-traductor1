@@ -1,3 +1,5 @@
+import { computeCacheKey, getCachedResult, setCachedResult } from './translationCache';
+
 export interface TranslateApiResult {
   transcript: string;
   detectedLanguage: string;
@@ -37,9 +39,30 @@ function extensionForMimeType(mimeType: string): string {
 }
 
 export async function callTranslateApi(params: TranslateApiParams): Promise<TranslateApiResult> {
+  // Cache local: si esta misma peticion (mismos bytes de audio + mismos
+  // parametros) ya se resolvio hace poco, se devuelve al instante sin tocar
+  // la red ni gastar cuota de Deepgram/Gemini/ElevenLabs.
+  const audioBuffer = await params.audioBlob.arrayBuffer();
+  const cacheKey = await computeCacheKey(audioBuffer, [
+    params.sourceLanguage,
+    params.targetLanguage,
+    params.systemPrompt,
+    params.voiceId,
+    params.stability,
+    params.speedMultiplier,
+  ]);
+
+  if (cacheKey) {
+    const cached = await getCachedResult(cacheKey);
+    if (cached) {
+      console.log('[translateApi] Cache HIT (IndexedDB) — respuesta instantanea, sin llamar a /api/translate');
+      return cached;
+    }
+  }
+
   const form = new FormData();
   const filename = `audio.${extensionForMimeType(params.audioBlob.type)}`;
-  console.log('[translateApi] Enviando audio:', params.audioBlob.type || '(sin type)', params.audioBlob.size, 'bytes como', filename);
+  console.log('[translateApi] Cache MISS. Enviando audio:', params.audioBlob.type || '(sin type)', params.audioBlob.size, 'bytes como', filename);
   form.append('audio', params.audioBlob, filename);
   form.append(
     'meta',
@@ -70,6 +93,9 @@ export async function callTranslateApi(params: TranslateApiParams): Promise<Tran
 
   const result = (await response.json()) as TranslateApiResult;
   console.log('[translateApi] Respuesta OK. transcript:', result.transcript?.slice(0, 60));
+
+  if (cacheKey) setCachedResult(cacheKey, result);
+
   return result;
 }
 
