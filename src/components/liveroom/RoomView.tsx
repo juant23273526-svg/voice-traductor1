@@ -1,13 +1,22 @@
-import { useCallback, useState } from 'react';
-import { QrCode, Users } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { QrCode, Users, Radio, Wifi, WifiOff, Loader2 } from 'lucide-react';
+import clsx from 'clsx';
 import { useRoom } from '@/hooks/useRoom';
 import { useAudioPipelineContext } from '@/context/AudioPipelineContext';
 import { SplitScreenMic } from './SplitScreenMic';
 import { SubtitleOverlay } from './SubtitleOverlay';
 import { QRCodeDisplay } from './QRCodeDisplay';
+import { WaveformVisualizer } from '@/components/shared/WaveformVisualizer';
 import { getLanguageOption } from '@/constants/languages';
 import { blobToBase64 } from '@/utils/blob';
 import type { RoomMessage, RoomParticipantRole } from '@/types';
+
+const CONNECTION_BADGE = {
+  connecting: { label: 'Conectando...', icon: Loader2, className: 'text-amber-400', spin: true },
+  open: { label: 'Conectado', icon: Wifi, className: 'text-emerald-400', spin: false },
+  closed: { label: 'Desconectado', icon: WifiOff, className: 'text-slate-500', spin: false },
+  error: { label: 'Error de conexion', icon: WifiOff, className: 'text-rose-400', spin: false },
+} as const;
 
 interface RoomViewProps {
   roomId: string;
@@ -17,10 +26,26 @@ interface RoomViewProps {
 }
 
 export function RoomView({ roomId, role, hostLanguage, guestLanguage }: RoomViewProps) {
-  const { messages, sendMessage, loading, error, guestJoined } = useRoom(roomId, role);
-  const { service, status } = useAudioPipelineContext();
+  const { messages, sendMessage, connectionStatus, loading, error, guestJoined } = useRoom(roomId, role);
+  const { service, status, volume } = useAudioPipelineContext();
   const [activeSide, setActiveSide] = useState<'own' | 'peer' | null>(null);
   const [pipelineError, setPipelineError] = useState<string | null>(null);
+
+  // Indicador visual de actividad del socket: se enciende brevemente cada vez
+  // que llega un mensaje nuevo (texto + audio) desde el Durable Object, para
+  // confirmar en pantalla que los paquetes efectivamente estan llegando.
+  const [packetFlash, setPacketFlash] = useState(false);
+  const previousMessageCount = useRef(messages.length);
+  useEffect(() => {
+    if (messages.length > previousMessageCount.current) {
+      console.log('[RoomView] Paquete recibido via WebSocket. Total mensajes:', messages.length);
+      setPacketFlash(true);
+      const timeout = setTimeout(() => setPacketFlash(false), 1200);
+      previousMessageCount.current = messages.length;
+      return () => clearTimeout(timeout);
+    }
+    previousMessageCount.current = messages.length;
+  }, [messages.length]);
 
   const ownLanguage = getLanguageOption(role === 'host' ? hostLanguage : guestLanguage);
   const peerLanguage = getLanguageOption(role === 'host' ? guestLanguage : hostLanguage);
@@ -81,6 +106,8 @@ export function RoomView({ roomId, role, hostLanguage, guestLanguage }: RoomView
 
   const roomUrl = `${window.location.origin}/room/${roomId}?role=guest&hostLang=${hostLanguage}&guestLang=${guestLanguage}`;
   const roomCode = roomId.replace(/-/g, '').slice(0, 6).toUpperCase();
+  const connectionBadge = CONNECTION_BADGE[connectionStatus];
+  const ConnectionIcon = connectionBadge.icon;
 
   return (
     <div className="mx-auto flex max-w-lg flex-col gap-6 px-4 py-6">
@@ -95,6 +122,22 @@ export function RoomView({ roomId, role, hostLanguage, guestLanguage }: RoomView
         {role === 'host' && !guestJoined && <QrCode className="text-slate-600" size={28} />}
       </header>
 
+      <div className="flex items-center justify-between rounded-2xl border border-slate-800 bg-slate-900/40 px-4 py-2.5 text-xs">
+        <div className={clsx('flex items-center gap-1.5 font-medium', connectionBadge.className)}>
+          <ConnectionIcon size={14} className={connectionBadge.spin ? 'animate-spin' : ''} />
+          {connectionBadge.label}
+        </div>
+        <div
+          className={clsx(
+            'flex items-center gap-1.5 font-medium transition-opacity duration-300',
+            packetFlash ? 'text-emerald-400 opacity-100' : 'text-slate-600 opacity-60'
+          )}
+        >
+          <Radio size={14} className={packetFlash ? 'animate-pulse' : ''} />
+          {packetFlash ? 'Paquete recibido' : 'Sin actividad'}
+        </div>
+      </div>
+
       {role === 'host' && !guestJoined && <QRCodeDisplay url={roomUrl} code={roomCode} />}
 
       <SplitScreenMic
@@ -105,6 +148,15 @@ export function RoomView({ roomId, role, hostLanguage, guestLanguage }: RoomView
         onPressStart={handlePressStart}
         onPressEnd={handlePressEnd}
       />
+
+      {activeSide && (
+        <WaveformVisualizer
+          volume={volume}
+          active={status === 'RECORDING'}
+          barColor={activeSide === 'own' ? '#6366f1' : '#10b981'}
+          className="mx-auto"
+        />
+      )}
 
       {pipelineError && (
         <p className="rounded-xl border border-rose-900 bg-rose-950/40 px-4 py-3 text-sm text-rose-300">

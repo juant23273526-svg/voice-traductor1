@@ -45,3 +45,5 @@ export function useRoom(roomId: string | undefined, role: RoomParticipantRole) {
 
   return { messages, sendMessage, connectionStatus, loading, error, guestJoined, hostOnline };
 }
+
+export type { ConnectionStatus };

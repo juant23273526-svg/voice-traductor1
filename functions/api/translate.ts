@@ -21,11 +21,15 @@ interface Env {
   CARTESIA_API_KEY?: string;
 }
 
-// Google retira/renombra modelos de Gemini con cierta frecuencia (p. ej.
-// gemini-1.5-* fueron deprecados). Si el modelo configurado responde 404
-// ("model not found"), se reintenta automaticamente con el siguiente de la
-// lista en vez de romper la traduccion en produccion.
-const GEMINI_MODEL_FALLBACKS = ['gemini-2.0-flash', 'gemini-1.5-flash'];
+// Modelo oficial solicitado como primario. Si Google lo retira/renombra y
+// empieza a responder 404 ("model not found"), se reintenta automaticamente
+// con el siguiente de la lista en vez de romper la traduccion en produccion.
+const GEMINI_MODEL_FALLBACKS = ['gemini-1.5-flash', 'gemini-2.0-flash'];
+
+// Tamaño minimo de audio (bytes) para intentar STT. Clips mas cortos (tap
+// accidental, silencio) no traen voz aprovechable y solo desperdician la
+// llamada a Deepgram devolviendo un error confuso.
+const MIN_AUDIO_BYTES = 2000;
 
 interface PipelineMeta {
   sourceLanguage: string;
@@ -55,7 +59,15 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     const meta = JSON.parse(metaRaw) as PipelineMeta;
     const audioBuffer = await audio.arrayBuffer();
 
-    const { transcript, detectedLanguage } = await runSpeechToText(audioBuffer, audio.type, env);
+    if (audioBuffer.byteLength < MIN_AUDIO_BYTES) {
+      console.error('[translate] Audio demasiado pequeño, se descarta sin llamar a Deepgram:', audioBuffer.byteLength, 'bytes');
+      return jsonResponse(
+        { error: 'Audio muy corto o vacío. Manten presionado el microfono mientras hablas.' },
+        422
+      );
+    }
+
+    const { transcript, detectedLanguage } = await runSpeechToText(audioBuffer, audio.type, meta.sourceLanguage, env);
     if (!transcript) {
       return jsonResponse({ error: 'No se detecto voz en el audio' }, 422);
     }
@@ -79,22 +91,45 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
 async function runSpeechToText(
   audioBuffer: ArrayBuffer,
   contentType: string,
+  sourceLanguage: string,
   env: Env
 ): Promise<{ transcript: string; detectedLanguage: string }> {
   if (!env.DEEPGRAM_API_KEY) {
     return { transcript: '(demo) transcripcion simulada — configura DEEPGRAM_API_KEY', detectedLanguage: 'es' };
   }
 
-  const response = await fetch(
-    'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&detect_language=true&punctuate=true&word_timestamps=true',
-    {
-      method: 'POST',
-      headers: { Authorization: `Token ${env.DEEPGRAM_API_KEY}`, 'Content-Type': contentType || 'audio/webm' },
-      body: audioBuffer,
-    }
-  );
+  // Deepgram acepta `language=<code>` para forzar el modelo al idioma
+  // esperado (mas preciso que `detect_language=true` en clips cortos, causa
+  // frecuente de "voz no detectada"). Se usa el idioma que ya declaro el
+  // caller (Slang/Live Room siempre mandan un codigo concreto); si viene
+  // "auto"/vacio (Clip Studio) se usa español como default explicito.
+  const language = sourceLanguage && sourceLanguage !== 'auto' ? sourceLanguage : 'es';
 
-  if (!response.ok) throw new Error(`Deepgram fallo: ${response.status}`);
+  // El Content-Type real del blob (audio/webm, audio/mp4, audio/aac en iOS
+  // Safari, etc.) se pasa tal cual llega del cliente — nunca se asume webm.
+  const resolvedContentType = contentType || 'audio/webm';
+  console.log('[translate] STT Deepgram — language:', language, 'contentType:', resolvedContentType, 'bytes:', audioBuffer.byteLength);
+
+  const params = new URLSearchParams({
+    model: 'nova-2',
+    language,
+    smart_format: 'true',
+    punctuate: 'true',
+    word_timestamps: 'true',
+  });
+
+  const response = await fetch(`https://api.deepgram.com/v1/listen?${params.toString()}`, {
+    method: 'POST',
+    headers: { Authorization: `Token ${env.DEEPGRAM_API_KEY}`, 'Content-Type': resolvedContentType },
+    body: audioBuffer,
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => '');
+    console.error('[translate] Deepgram fallo:', response.status, errorBody.slice(0, 300));
+    throw new Error(`Deepgram fallo: ${response.status}`);
+  }
+
   const data = (await response.json()) as {
     results: { channels: Array<{ detected_language?: string; alternatives: Array<{ transcript: string }> }> };
   };
@@ -102,7 +137,7 @@ async function runSpeechToText(
   const channel = data.results.channels[0];
   return {
     transcript: channel?.alternatives[0]?.transcript ?? '',
-    detectedLanguage: channel?.detected_language ?? '',
+    detectedLanguage: channel?.detected_language || language,
   };
 }
 
@@ -134,7 +169,13 @@ async function runTranslation(
     }
   }
 
-  throw lastError ?? new Error('Gemini fallo con todos los modelos configurados');
+  // Fallback estatico/local: si TODOS los modelos de Gemini fallan (404, rate
+  // limit, region bloqueada, etc.) no se rompe el pipeline completo con un
+  // 500 — se degrada devolviendo el texto original sin traducir, para que el
+  // cliente reciba una respuesta 200 parseable (transcripcion + audio TTS
+  // siguen funcionando) en vez de un error duro.
+  console.error('[translate] Gemini fallo con todos los modelos configurados, usando fallback local:', lastError?.message);
+  return text;
 }
 
 async function callGeminiGenerateContent(

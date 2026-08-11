@@ -27,6 +27,12 @@ const MIME_TYPE_CANDIDATES = [
   'audio/mpeg',
 ];
 
+// Tamaño minimo de audio (bytes) para intentar enviarlo al backend. Un tap
+// accidental o soltar muy rapido el boton de microfono genera un blob casi
+// vacio que Deepgram no puede transcribir — se corta antes de gastar una
+// llamada de red.
+const MIN_AUDIO_BYTES = 2000;
+
 function pickSupportedMimeType(): string | undefined {
   if (typeof MediaRecorder === 'undefined' || typeof MediaRecorder.isTypeSupported !== 'function') {
     return undefined;
@@ -172,6 +178,11 @@ export class AudioPipelineService {
    */
   async runFullPipeline(audioBlob: Blob, options: RunTranslationOptions): Promise<PipelineResult> {
     try {
+      if (audioBlob.size < MIN_AUDIO_BYTES) {
+        console.error('[AudioPipeline] Audio capturado demasiado pequeño:', audioBlob.size, 'bytes — se aborta sin llamar al backend');
+        throw new Error('Grabacion muy corta. Manten presionado el microfono mientras hablas.');
+      }
+
       this.setStatus('TRANSCRIBING');
 
       const apiResult = await callTranslateApi({
