@@ -69,10 +69,30 @@ function resolveAudioContentType(file: File): string {
 
 export const onRequestOptions: PagesFunction = async () => preflightResponse();
 
+/** Verifica context.env y loguea EXACTAMENTE cual variable falta, para poder diagnosticar la configuracion de secrets en Cloudflare Pages sin adivinar. */
+function logMissingEnvVars(env: Env): void {
+  const required: Array<[key: keyof Env, name: string]> = [
+    ['DEEPGRAM_API_KEY', 'DEEPGRAM_API_KEY'],
+    ['GEMINI_API_KEY', 'GEMINI_API_KEY'],
+    ['ELEVENLABS_API_KEY', 'ELEVENLABS_API_KEY'],
+  ];
+  for (const [key, name] of required) {
+    if (!env[key]) {
+      console.error(`[translate] Variable de entorno faltante en context.env: ${name} (usa "wrangler pages secret put ${name}")`);
+    }
+  }
+}
+
 export const onRequestPost: PagesFunction<Env> = async (context) => {
   const { request, env } = context;
 
   try {
+    // Lectura y verificacion de context.env: las 3 keys se extraen
+    // directamente de context.env (nunca de process.env, que no existe en
+    // el runtime de Cloudflare Workers/Pages) y se loguea individualmente
+    // cualquiera que falte.
+    logMissingEnvVars(env);
+
     const form = await request.formData();
     // El tipado de @cloudflare/workers-types simplifica FormData.get() a
     // `string | null`, pero en runtime los campos de archivo llegan como File.
@@ -80,7 +100,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     const metaRaw = form.get('meta');
 
     if (typeof audio === 'string' || audio === null || typeof metaRaw !== 'string') {
-      return jsonResponse({ error: 'Se requieren los campos "audio" y "meta"' }, 400);
+      return jsonResponse({ success: false, error: 'Se requieren los campos "audio" y "meta"' }, 400);
     }
 
     const meta = JSON.parse(metaRaw) as PipelineMeta;
@@ -105,7 +125,7 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     if (audioBuffer.byteLength < MIN_AUDIO_BYTES) {
       console.error('[translate] Audio demasiado pequeño/vacio, se descarta sin llamar a Deepgram:', audioBuffer.byteLength, 'bytes');
       return jsonResponse(
-        { error: 'Audio muy corto o vacío. Manten presionado el microfono mientras hablas.' },
+        { success: false, error: 'Audio muy corto o vacío. Manten presionado el microfono mientras hablas.' },
         400
       );
     }
@@ -113,22 +133,43 @@ export const onRequestPost: PagesFunction<Env> = async (context) => {
     const { transcript, detectedLanguage } = await runSpeechToText(audioBuffer, resolvedContentType, meta.sourceLanguage, env);
     if (!transcript) {
       console.error('[translate] Deepgram no devolvio transcript (audio inaudible/silencio). bytes:', audioBuffer.byteLength, 'contentType:', resolvedContentType);
-      return jsonResponse({ error: 'Audio inaudible o en silencio. Intenta grabar de nuevo hablando mas cerca del microfono.' }, 400);
+      return jsonResponse(
+        { success: false, error: 'Audio inaudible o en silencio. Intenta grabar de nuevo hablando mas cerca del microfono.' },
+        400
+      );
     }
 
     const translatedText = await runTranslation(transcript, detectedLanguage || meta.sourceLanguage, meta, env);
-    const { audioBase64, mimeType, durationEstimateMs } = await runTextToSpeech(translatedText, meta, env);
+
+    // Etapa de TTS aislada: si ElevenLabs falla (quota, red, key invalida)
+    // pero STT+Gemini si funcionaron, se devuelve una respuesta PARCIAL con
+    // transcript/traduccion y audio vacio, en vez de tirar todo el endpoint
+    // por un fallo de una sola etapa.
+    let synthesis: { audioBase64: string; mimeType: string; durationEstimateMs: number };
+    try {
+      synthesis = await runTextToSpeech(translatedText, meta, env);
+    } catch (err) {
+      console.error('[translate] ElevenLabs (TTS) fallo, se devuelve respuesta parcial sin audio:', err instanceof Error ? err.message : err);
+      synthesis = { audioBase64: '', mimeType: 'audio/mpeg', durationEstimateMs: Math.max(600, translatedText.length * 60) };
+    }
 
     return jsonResponse({
+      success: true,
       transcript,
       detectedLanguage: detectedLanguage || meta.sourceLanguage,
       translatedText,
-      audioBase64,
-      mimeType,
-      durationEstimateMs,
+      audioBase64: synthesis.audioBase64,
+      mimeType: synthesis.mimeType,
+      durationEstimateMs: synthesis.durationEstimateMs,
     });
   } catch (err) {
-    return jsonResponse({ error: (err as Error).message }, 500);
+    // Red de seguridad final: NINGUN error inesperado (crash de parseo,
+    // excepcion no controlada en cualquier etapa, etc.) debe llegar al
+    // cliente como un 500 crudo. Se loguea con maxima visibilidad y se
+    // responde siempre JSON valido y parseable.
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('CRITICAL TRANSLATE ERROR:', err);
+    return jsonResponse({ success: false, error: `Error procesando el audio en el servidor: ${message}` }, 400);
   }
 };
 
@@ -149,8 +190,6 @@ async function runSpeechToText(
   // "auto"/vacio (Clip Studio) se usa español como default explicito.
   const language = sourceLanguage && sourceLanguage !== 'auto' ? sourceLanguage : 'es';
 
-  console.log('[translate] STT Deepgram — language:', language, 'Content-Type:', resolvedContentType, 'bytes:', audioBuffer.byteLength);
-
   const params = new URLSearchParams({
     model: 'nova-2',
     language,
@@ -158,6 +197,26 @@ async function runSpeechToText(
     punctuate: 'true',
     word_timestamps: 'true',
   });
+
+  // El audio extraido de video en Clip Studio (FFmpegService.ts) se codifica
+  // deliberadamente como WAV PCM 16kHz mono para mantener el payload liviano;
+  // se declara explicitamente a Deepgram en vez de confiar solo en el header
+  // Content-Type, para evitar cualquier ambiguedad de parseo del contenedor.
+  if (resolvedContentType === 'audio/wav') {
+    params.set('encoding', 'linear16');
+    params.set('sample_rate', '16000');
+  }
+
+  console.log(
+    '[translate] STT Deepgram — language:',
+    language,
+    'Content-Type:',
+    resolvedContentType,
+    'bytes:',
+    audioBuffer.byteLength,
+    'query:',
+    params.toString()
+  );
 
   const response = await fetch(`https://api.deepgram.com/v1/listen?${params.toString()}`, {
     method: 'POST',

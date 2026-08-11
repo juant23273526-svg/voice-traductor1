@@ -50,7 +50,12 @@ export async function extractAudioFromVideo(videoFile: File): Promise<Blob> {
   console.log('[FFmpegService] Extrayendo audio de', videoFile.name, videoFile.type, videoFile.size, 'bytes');
 
   await ffmpeg.writeFile(inputName, await fetchFile(videoFile));
-  await ffmpeg.exec(['-i', inputName, '-vn', '-acodec', 'pcm_s16le', '-ar', '44100', outputName]);
+  // 16kHz mono 16-bit PCM: suficiente calidad para STT (Deepgram recomienda
+  // 16kHz para voz) y reduce el Blob resultante a una fraccion del tamaño
+  // que daria 44.1kHz estereo — clave para no acercarse al limite de payload
+  // de Cloudflare Pages Functions y para que el upload sea practicamente
+  // instantaneo.
+  await ffmpeg.exec(['-i', inputName, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', outputName]);
   const data = await ffmpeg.readFile(outputName);
 
   await ffmpeg.deleteFile(inputName);
