@@ -1,4 +1,5 @@
 import { callTranslateApi, base64ToBlob } from './translateApi';
+import { getSharedAudioContext, unlockAudioPlayback, playAudioBlob } from './audioUnlock';
 import type {
   AudioRecorderOptions,
   PipelineEventListener,
@@ -61,7 +62,6 @@ export class AudioPipelineService {
   private chunks: Blob[] = [];
   private status: PipelineStatus = 'IDLE';
   private analyser: AnalyserNode | null = null;
-  private audioContext: AudioContext | null = null;
   private volumeRafId: number | null = null;
 
   private listeners: { [K in keyof PipelineEventMap]?: Set<PipelineEventListener<K>> } = {};
@@ -93,8 +93,11 @@ export class AudioPipelineService {
     // Debe ejecutarse de forma sincrona (antes del primer `await`) para que
     // el AudioContext se desbloquee dentro del mismo gesto de usuario que
     // origino esta llamada (pointerdown del boton de microfono) — requisito
-    // de la politica de autoplay de iOS Safari.
-    this.unlockAudioPlayback();
+    // de la politica de autoplay de iOS Safari. Se usa el AudioContext
+    // COMPARTIDO de toda la app (audioUnlock.ts) para que la reproduccion
+    // de audio asincrono ajeno (ej. mensajes de Live Room) tambien quede
+    // desbloqueada.
+    unlockAudioPlayback();
 
     const constraints = { ...DEFAULT_RECORDER_OPTIONS, ...options };
     const preferredConstraints: MediaTrackConstraints = {
@@ -210,7 +213,7 @@ export class AudioPipelineService {
 
       if (options.autoPlay !== false && apiResult.audioBase64) {
         this.setStatus('PLAYING');
-        await this.playAudio(audioBlobResult);
+        await playAudioBlob(audioBlobResult);
       }
       this.setStatus('IDLE');
 
@@ -223,81 +226,8 @@ export class AudioPipelineService {
     }
   }
 
-  /**
-   * Crea (una sola vez) el AudioContext compartido del servicio. Se reutiliza
-   * tanto para el medidor de volumen como para la reproduccion del TTS, ya
-   * que en iOS Safari solo un AudioContext "desbloqueado" por un gesto de
-   * usuario puede reproducir audio programaticamente despues.
-   */
-  private ensureAudioContext(): AudioContext {
-    if (!this.audioContext) {
-      const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      this.audioContext = new Ctor();
-    }
-    return this.audioContext;
-  }
-
-  /**
-   * Desbloquea la reproduccion de audio en iOS Safari: debe llamarse de forma
-   * sincrona dentro del gesto de usuario (click/touch) que inicia la
-   * grabacion, antes de cualquier `await`. Resume el AudioContext y reproduce
-   * un buffer silencioso para "activar" el audio de la pagina.
-   */
-  private unlockAudioPlayback(): void {
-    try {
-      const ctx = this.ensureAudioContext();
-      if (ctx.state === 'suspended') {
-        void ctx.resume().then(
-          () => console.log('[AudioPipeline] AudioContext resumido (iOS unlock)'),
-          (err) => console.error('[AudioPipeline] No se pudo resumir AudioContext', err)
-        );
-      }
-      const silentBuffer = ctx.createBuffer(1, 1, 22050);
-      const source = ctx.createBufferSource();
-      source.buffer = silentBuffer;
-      source.connect(ctx.destination);
-      source.start(0);
-    } catch (err) {
-      console.error('[AudioPipeline] Fallo al desbloquear audio (iOS)', err);
-    }
-  }
-
-  /**
-   * Reproduce el audio TTS via Web Audio API (decodeAudioData + BufferSource)
-   * usando el AudioContext ya desbloqueado, en vez de `new Audio().play()`
-   * que iOS Safari puede bloquear si no ocurre dentro del gesto de usuario.
-   */
-  private async playAudio(audioBlob: Blob): Promise<void> {
-    const ctx = this.ensureAudioContext();
-    if (ctx.state === 'suspended') {
-      await ctx.resume().catch((err) => console.error('[AudioPipeline] No se pudo resumir AudioContext antes de reproducir', err));
-    }
-
-    let audioBuffer: AudioBuffer;
-    try {
-      const arrayBuffer = await audioBlob.arrayBuffer();
-      audioBuffer = await ctx.decodeAudioData(arrayBuffer);
-    } catch (err) {
-      console.error('[AudioPipeline] Error decodificando audio TTS', err);
-      throw err instanceof Error ? err : new Error('Error decodificando audio sintetizado');
-    }
-
-    return new Promise((resolve, reject) => {
-      try {
-        const source = ctx.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(ctx.destination);
-        source.onended = () => resolve();
-        source.start(0);
-      } catch (err) {
-        console.error('[AudioPipeline] Error reproduciendo audio TTS', err);
-        reject(err instanceof Error ? err : new Error('Error reproduciendo audio sintetizado'));
-      }
-    });
-  }
-
   private setupVolumeMeter(stream: MediaStream): void {
-    const ctx = this.ensureAudioContext();
+    const ctx = getSharedAudioContext();
     const source = ctx.createMediaStreamSource(stream);
     this.analyser = ctx.createAnalyser();
     this.analyser.fftSize = 256;
@@ -320,9 +250,9 @@ export class AudioPipelineService {
       this.volumeRafId = null;
     }
     this.analyser = null;
-    // El AudioContext se mantiene vivo (no se cierra) entre grabaciones:
-    // en iOS Safari solo permanece "desbloqueado" mientras no se cree uno
-    // nuevo fuera de un gesto de usuario.
+    // El AudioContext compartido (audioUnlock.ts) NO se cierra aqui: vive a
+    // nivel de app y se reutiliza para reproducir audio ajeno (Live Room)
+    // que puede llegar en cualquier momento, sin depender de un nuevo gesto.
     this.mediaStream?.getTracks().forEach((track) => track.stop());
     this.mediaStream = null;
     this.mediaRecorder = null;
@@ -330,8 +260,6 @@ export class AudioPipelineService {
 
   dispose(): void {
     this.teardownStream();
-    void this.audioContext?.close();
-    this.audioContext = null;
     this.listeners = {};
   }
 }

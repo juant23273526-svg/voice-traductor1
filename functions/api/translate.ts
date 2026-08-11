@@ -15,9 +15,17 @@ import { jsonResponse, preflightResponse } from '../_shared/cors';
 interface Env {
   DEEPGRAM_API_KEY?: string;
   GEMINI_API_KEY?: string;
+  /** Override opcional del modelo Gemini (por si el default queda deprecado). */
+  GEMINI_MODEL?: string;
   ELEVENLABS_API_KEY?: string;
   CARTESIA_API_KEY?: string;
 }
+
+// Google retira/renombra modelos de Gemini con cierta frecuencia (p. ej.
+// gemini-1.5-* fueron deprecados). Si el modelo configurado responde 404
+// ("model not found"), se reintenta automaticamente con el siguiente de la
+// lista en vez de romper la traduccion en produccion.
+const GEMINI_MODEL_FALLBACKS = ['gemini-2.0-flash', 'gemini-1.5-flash'];
 
 interface PipelineMeta {
   sourceLanguage: string;
@@ -112,25 +120,73 @@ async function runTranslation(
     meta.systemPrompt ??
     `Traduce el siguiente texto de ${sourceLanguage} a ${meta.targetLanguage}. Conserva el tono y la emocion. Responde unicamente con la traduccion, sin explicaciones.`;
 
+  // Si hay un override explicito (env.GEMINI_MODEL) se intenta primero; luego
+  // se recorre la lista de fallback. Duplicados se descartan.
+  const models = Array.from(new Set([env.GEMINI_MODEL, ...GEMINI_MODEL_FALLBACKS].filter(Boolean))) as string[];
+
+  let lastError: Error | null = null;
+  for (const model of models) {
+    try {
+      return await callGeminiGenerateContent(model, instructions, text, env.GEMINI_API_KEY);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.error(`[translate] Gemini modelo "${model}" fallo, probando siguiente si hay:`, lastError.message);
+    }
+  }
+
+  throw lastError ?? new Error('Gemini fallo con todos los modelos configurados');
+}
+
+async function callGeminiGenerateContent(
+  model: string,
+  systemInstruction: string,
+  text: string,
+  apiKey: string
+): Promise<string> {
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${env.GEMINI_API_KEY}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: instructions }] },
+        systemInstruction: { parts: [{ text: systemInstruction }] },
         contents: [{ role: 'user', parts: [{ text }] }],
+        // Los presets de jerga/dialecto (Spanglish Fronterizo, Norteño, etc.)
+        // usan lenguaje coloquial que los umbrales default de Gemini a veces
+        // bloquean por error; se relajan a BLOCK_ONLY_HIGH para evitar
+        // respuestas vacias (candidates sin content.parts).
+        safetySettings: [
+          { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_ONLY_HIGH' },
+          { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_ONLY_HIGH' },
+          { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_ONLY_HIGH' },
+          { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_ONLY_HIGH' },
+        ],
         generationConfig: { temperature: 0.7, maxOutputTokens: 512 },
       }),
     }
   );
 
-  if (!response.ok) throw new Error(`Gemini fallo: ${response.status}`);
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => '');
+    throw new Error(`Gemini (${model}) fallo: ${response.status} ${errorBody.slice(0, 300)}`);
+  }
+
   const data = (await response.json()) as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    candidates?: Array<{
+      content?: { parts?: Array<{ text?: string }> };
+      finishReason?: string;
+    }>;
+    promptFeedback?: { blockReason?: string };
   };
-  const translated = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-  if (!translated) throw new Error('Gemini no devolvio traduccion');
+
+  const candidate = data.candidates?.[0];
+  const translated = candidate?.content?.parts?.[0]?.text?.trim();
+
+  if (!translated) {
+    const reason = data.promptFeedback?.blockReason ?? candidate?.finishReason ?? 'desconocida';
+    throw new Error(`Gemini (${model}) no devolvio texto valido (razon: ${reason})`);
+  }
+
   return translated;
 }
 

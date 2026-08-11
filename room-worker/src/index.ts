@@ -39,7 +39,14 @@ export class RoomDurableObject implements DurableObject {
     this.broadcastPresence();
 
     ws.addEventListener('message', (event: MessageEvent) => {
-      if (typeof event.data !== 'string') return;
+      // El cliente siempre envia JSON como texto (ver websocketRoom.ts); si
+      // llegara un frame binario (ArrayBuffer/Blob) se descarta explicitamente
+      // en vez de intentar relayarlo tal cual, para no reenviar basura al otro
+      // participante.
+      if (typeof event.data !== 'string') {
+        console.error('[RoomDO] Frame no textual recibido, se ignora:', typeof event.data);
+        return;
+      }
       this.relay(event.data, ws);
     });
 
@@ -51,12 +58,56 @@ export class RoomDurableObject implements DurableObject {
     ws.addEventListener('error', cleanup);
   }
 
-  /** Reenvia el mensaje (texto + audio en base64) a todos menos al emisor. */
+  /**
+   * Reenvia el mensaje (texto + audio en base64) a todos menos al emisor.
+   * Valida que el payload tenga la forma esperada (RoomSocketEvent con
+   * `type: 'message'` y `message.audioBase64`/`mimeType`) antes de
+   * retransmitirlo: un JSON malformado o con campos faltantes se descarta y
+   * se loguea, en vez de reenviar una estructura invalida que el receptor no
+   * pueda deserializar (causa raiz de "no reconoce audio" cuando el payload
+   * no coincide con lo que el cliente espera).
+   */
   private relay(data: string, sender: WebSocket): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(data);
+    } catch (err) {
+      console.error('[RoomDO] JSON invalido recibido, se descarta sin relayar:', err);
+      return;
+    }
+
+    if (!this.isValidRoomSocketEvent(parsed)) {
+      console.error('[RoomDO] Payload con estructura invalida, se descarta sin relayar:', JSON.stringify(parsed).slice(0, 200));
+      return;
+    }
+
     for (const ws of this.sessions.keys()) {
       if (ws === sender) continue;
       this.safeSend(ws, data);
     }
+  }
+
+  /** Valida minimamente la forma de un RoomSocketEvent antes de retransmitirlo. */
+  private isValidRoomSocketEvent(value: unknown): boolean {
+    if (typeof value !== 'object' || value === null) return false;
+    const event = value as { type?: unknown; message?: unknown };
+
+    if (event.type === 'presence') return true;
+
+    if (event.type === 'message') {
+      if (typeof event.message !== 'object' || event.message === null) return false;
+      const message = event.message as Record<string, unknown>;
+      return (
+        typeof message.id === 'string' &&
+        typeof message.senderRole === 'string' &&
+        typeof message.originalText === 'string' &&
+        typeof message.translatedText === 'string' &&
+        (message.audioBase64 === null || typeof message.audioBase64 === 'string') &&
+        (message.mimeType === null || typeof message.mimeType === 'string')
+      );
+    }
+
+    return false;
   }
 
   private broadcastPresence(): void {

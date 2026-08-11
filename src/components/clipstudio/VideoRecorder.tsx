@@ -57,22 +57,41 @@ export function VideoRecorder({ onFileRecorded }: VideoRecorderProps) {
 
   const startPreview = useCallback(async () => {
     setError(null);
+
+    // Fallback gradual: primero constraints "ideales" (camara frontal/trasera
+    // explicita), y si el dispositivo/navegador las rechaza (OverconstrainedError,
+    // comun en algunos Android/desktop sin esa camara, o Safari en ciertos casos)
+    // se reintenta con constraints minimas que practicamente siempre funcionan.
+    let stream: MediaStream;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode },
-        audio: true,
-      });
-      console.log('[VideoRecorder] Camara capturada', stream.getVideoTracks()[0]?.getSettings());
-      streamRef.current = stream;
-      if (videoPreviewRef.current) {
-        videoPreviewRef.current.srcObject = stream;
-        await videoPreviewRef.current.play().catch((err) => console.error('[VideoRecorder] Error reproduciendo preview', err));
-      }
-      setIsPreviewing(true);
+      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode }, audio: true });
     } catch (err) {
-      console.error('[VideoRecorder] getUserMedia (camara) fallo', err);
-      setError('No se pudo acceder a la camara/microfono. Revisa los permisos.');
+      console.error('[VideoRecorder] getUserMedia con facingMode fallo, reintentando con video:true', err);
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      } catch (fallbackErr) {
+        console.error('[VideoRecorder] getUserMedia (camara) fallo definitivamente', fallbackErr);
+        setError('No se pudo acceder a la camara/microfono. Revisa los permisos del navegador.');
+        return;
+      }
     }
+
+    console.log('[VideoRecorder] Camara capturada', stream.getVideoTracks()[0]?.getSettings());
+    streamRef.current = stream;
+
+    if (videoPreviewRef.current) {
+      videoPreviewRef.current.srcObject = stream;
+      // Bloque seguro: en algunos navegadores play() rechaza la promesa
+      // (AbortError si el elemento se desmonta a mitad de la carga, etc.)
+      // sin que eso deba tratarse como un fallo fatal de la captura.
+      try {
+        await videoPreviewRef.current.play();
+      } catch (playErr) {
+        console.error('[VideoRecorder] Error reproduciendo preview (no bloqueante)', playErr);
+      }
+    }
+
+    setIsPreviewing(true);
   }, [facingMode]);
 
   const switchCamera = useCallback(async () => {

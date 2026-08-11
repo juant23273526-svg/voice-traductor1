@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { base64ToBlob } from '@/services/translateApi';
+import { playAudioBlob } from '@/services/audioUnlock';
 import type { RoomMessage, RoomParticipantRole } from '@/types';
 
 interface SubtitleOverlayProps {
@@ -27,8 +28,12 @@ export function SubtitleOverlay({ messages, currentRole }: SubtitleOverlayProps)
 
     playedIds.current.add(latest.id);
     const blob = base64ToBlob(latest.audioBase64, latest.mimeType ?? 'audio/mpeg');
-    const audio = new Audio(URL.createObjectURL(blob));
-    void audio.play();
+    console.log('[SubtitleOverlay] Reproduciendo audio entrante:', latest.id, blob.size, 'bytes');
+    // Se reproduce via el AudioContext compartido ya desbloqueado (audioUnlock.ts)
+    // en vez de `new Audio().play()`: este mensaje llega de forma asincrona por
+    // WebSocket, sin gesto de usuario propio, y iOS Safari bloquearia el
+    // autoplay directo de un <audio>/Audio() en ese contexto.
+    playAudioBlob(blob).catch((err) => console.error('[SubtitleOverlay] Error reproduciendo audio entrante', err));
   }, [messages, currentRole]);
 
   if (messages.length === 0) {
